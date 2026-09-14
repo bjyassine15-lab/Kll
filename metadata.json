@@ -1,0 +1,9 @@
+{
+  "name": "StudyMind",
+  "description": "المساعد الدراسي الذكي - مساعد صوتي فوري، تسجيل وتحليل الحصص المدرسية، تعرف على صوت الأستاذ وتخطيط ذكي للدراسة",
+  "requestFramePermissions": [
+    "android.permission.RECORD_AUDIO",
+    "android.permission.CAMERA"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
