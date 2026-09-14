@@ -97,9 +97,13 @@ class ExampleRobolectricTest {
         assertEquals(SpeakerType.TEACHER, resTeacher.type)
         assertTrue(resTeacher.teacherMatchScore > 0.6f)
 
-        // 3. Reset or low eagle score -> Student voice
+        // 3. Reset and feed frames with low eagle score -> Student voice after hysteresis window
         engine.reset()
-        val resStudent = engine.classify(isVoiceActive = true, eagleScores = floatArrayOf(0.10f), rmsEnergy = 800.0)
+        var resStudent = engine.classify(isVoiceActive = true, eagleScores = floatArrayOf(0.10f), rmsEnergy = 800.0)
+        assertEquals(SpeakerType.UNKNOWN, resStudent.type) // Not enough frames yet
+        repeat(4) {
+            resStudent = engine.classify(isVoiceActive = true, eagleScores = floatArrayOf(0.10f), rmsEnergy = 800.0)
+        }
         assertEquals(SpeakerType.STUDENT, resStudent.type)
     }
 }

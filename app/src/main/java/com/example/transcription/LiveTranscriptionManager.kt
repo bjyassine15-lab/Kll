@@ -1,173 +1,134 @@
 package com.example.transcription
 
-import android.util.Base64
 import com.example.BuildConfig
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.serialization.json.*
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.ByteArrayOutputStream
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import android.util.Base64
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
 
-class LiveTranscriptionManager(
-    private val customApiKey: String? = null
-) {
-    private val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-    }
+class LiveTranscriptionManager(private val customApiKey: String? = null) {
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    private var socket: WebSocket? = null
+    private var client: OkHttpClient? = null
+    private var ready = CompletableDeferred<Boolean>()
 
-    private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
-        .build()
+    private val _transcripts = MutableSharedFlow<TranscriptionEvent>(extraBufferCapacity = 128)
+    val transcripts: SharedFlow<TranscriptionEvent> = _transcripts
 
-    private fun getApiKey(): String {
-        val key = customApiKey?.takeIf { it.isNotBlank() && it != "GEMINI_API_KEY_HERE" }
+    data class TranscriptionEvent(val text: String, val language: String?, val atMillis: Long)
+
+    private fun key(): String {
+        val k = customApiKey?.takeIf { it.isNotBlank() && it != "GEMINI_API_KEY_HERE" }
             ?: BuildConfig.GEMINI_API_KEY
-        return if (key.isBlank() || key == "GEMINI_API_KEY_HERE") "" else key
+        return if (k == "GEMINI_API_KEY_HERE") "" else k.trim()
     }
 
-    /**
-     * Packages a 16kHz mono 16-bit PCM chunk into a standard WAV byte array with header.
-     */
-    private fun pcmToWav(pcm: ShortArray, sampleRate: Int = 16000): ByteArray {
-        val pcmBytes = ByteArray(pcm.size * 2)
-        ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(pcm)
+    fun connect(subjectName: String, customVocabulary: List<String> = emptyList()) {
+        val apiKey = key()
+        if (apiKey.isBlank()) return
+        close()
+        ready = CompletableDeferred()
+        client = OkHttpClient.Builder()
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
+            .build()
 
-        val totalDataLen = pcmBytes.size + 36
-        val byteRate = sampleRate * 2 // 16-bit mono
-
-        val header = ByteArray(44)
-        header[0] = 'R'.code.toByte()
-        header[1] = 'I'.code.toByte()
-        header[2] = 'F'.code.toByte()
-        header[3] = 'F'.code.toByte()
-        header[4] = (totalDataLen and 0xff).toByte()
-        header[5] = ((totalDataLen shr 8) and 0xff).toByte()
-        header[6] = ((totalDataLen shr 16) and 0xff).toByte()
-        header[7] = ((totalDataLen shr 24) and 0xff).toByte()
-        header[8] = 'W'.code.toByte()
-        header[9] = 'A'.code.toByte()
-        header[10] = 'V'.code.toByte()
-        header[11] = 'E'.code.toByte()
-        header[12] = 'f'.code.toByte()
-        header[13] = 'm'.code.toByte()
-        header[14] = 't'.code.toByte()
-        header[15] = ' '.code.toByte()
-        header[16] = 16 // 4 bytes: size of 'fmt ' chunk
-        header[17] = 0
-        header[18] = 0
-        header[19] = 0
-        header[20] = 1 // format = 1 (PCM)
-        header[21] = 0
-        header[22] = 1 // channels = 1 (mono)
-        header[23] = 0
-        header[24] = (sampleRate and 0xff).toByte()
-        header[25] = ((sampleRate shr 8) and 0xff).toByte()
-        header[26] = ((sampleRate shr 16) and 0xff).toByte()
-        header[27] = ((sampleRate shr 24) and 0xff).toByte()
-        header[28] = (byteRate and 0xff).toByte()
-        header[29] = ((byteRate shr 8) and 0xff).toByte()
-        header[30] = ((byteRate shr 16) and 0xff).toByte()
-        header[31] = ((byteRate shr 24) and 0xff).toByte()
-        header[32] = 2 // block align (1 channel * 2 bytes)
-        header[33] = 0
-        header[34] = 16 // bits per sample
-        header[35] = 0
-        header[36] = 'd'.code.toByte()
-        header[37] = 'a'.code.toByte()
-        header[38] = 't'.code.toByte()
-        header[39] = 'a'.code.toByte()
-        header[40] = (pcmBytes.size and 0xff).toByte()
-        header[41] = ((pcmBytes.size shr 8) and 0xff).toByte()
-        header[42] = ((pcmBytes.size shr 16) and 0xff).toByte()
-        header[43] = ((pcmBytes.size shr 24) and 0xff).toByte()
-
-        val output = ByteArrayOutputStream(header.size + pcmBytes.size)
-        output.write(header)
-        output.write(pcmBytes)
-        return output.toByteArray()
-    }
-
-    /**
-     * Transcribes an audio chunk, injecting custom subject and chapter vocabulary
-     * with Tunisian dialect and French scientific code-switching awareness.
-     */
-    suspend fun transcribeAudioChunk(
-        pcm: ShortArray,
-        subjectName: String,
-        customVocabulary: List<String> = emptyList()
-    ): Result<String> = withContext(Dispatchers.IO) {
-        val apiKey = getApiKey()
-        if (apiKey.isBlank()) {
-            return@withContext Result.failure(IllegalStateException("مفتاح Gemini API غير مهيأ."))
-        }
-
-        val wavBytes = pcmToWav(pcm)
-        val base64Wav = Base64.encodeToString(wavBytes, Base64.NO_WRAP)
-
-        val vocabPrompt = if (customVocabulary.isNotEmpty()) {
-            "المصطلحات المحتملة في هذا الدرس: ${customVocabulary.joinToString(", ")}."
-        } else ""
-
-        val prompt = """
-            فرّغ هذا التسجيل الصوتي من قاعة درس بدقة:
-            - المادة: $subjectName.
-            - الحديث مزيج طبيعي بين اللهجة التونسية والفرنسية للمصطلحات العلمية والعربية الفصحى.
-            $vocabPrompt
-            - اكتب ما قيل حرفياً بدون أي مقدمات أو شروحات إضافية.
-            - إذا كان المقطع مجرد ضجيج غير مفهوم أو سكوت، أعد نصاً فارغاً "".
-        """.trimIndent()
-
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
-
-        val requestBody = buildJsonObject {
-            putJsonArray("contents") {
-                addJsonObject {
-                    putJsonArray("parts") {
-                        addJsonObject { put("text", prompt) }
-                        addJsonObject {
-                            putJsonObject("inlineData") {
-                                put("mimeType", "audio/wav")
-                                put("data", base64Wav)
+        val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        val request = Request.Builder().url(url).build()
+        socket = client!!.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(ws: WebSocket, response: Response) {
+                val setup = buildJsonObject {
+                    putJsonObject("setup") {
+                        put("model", "models/gemini-3.5-transcribe-live")
+                        putJsonObject("generationConfig") {
+                            putJsonArray("responseModalities") { add("TEXT") }
+                        }
+                        putJsonObject("inputAudioTranscription") {
+                            putJsonArray("languageCodes") { }
+                            if (customVocabulary.isNotEmpty()) {
+                                putJsonArray("customVocabulary") {
+                                    customVocabulary.take(100).forEach { add(it) }
+                                }
+                            }
+                            put("mode", "SMART")
+                        }
+                        putJsonObject("systemInstruction") {
+                            putJsonArray("parts") {
+                                addJsonObject {
+                                    put("text", """
+                                        This is a Tunisian school class.
+                                        Subject: $subjectName
+                                        Audio may contain Tunisian Arabic, Modern Standard Arabic and French scientific terminology.
+                                        Transcribe faithfully; do not summarize.
+                                    """.trimIndent())
+                                }
                             }
                         }
                     }
                 }
+                ws.send(setup.toString())
             }
-            putJsonObject("generationConfig") {
-                put("temperature", 0.1)
+
+            override fun onMessage(ws: WebSocket, text: String) {
+                runCatching {
+                    val root = json.parseToJsonElement(text).jsonObject
+                    if (root["setupComplete"] != null) {
+                        if (!ready.isCompleted) ready.complete(true)
+                        return@runCatching
+                    }
+                    val content = root["serverContent"]?.jsonObject ?: return@runCatching
+                    val tr = content["inputTranscription"]?.jsonObject ?: return@runCatching
+                    val txt = tr["text"]?.jsonPrimitive?.contentOrNull.orEmpty().trim()
+                    val lang = tr["languageCode"]?.jsonPrimitive?.contentOrNull
+                    if (txt.isNotBlank()) {
+                        _transcripts.tryEmit(TranscriptionEvent(txt, lang, System.currentTimeMillis()))
+                    }
+                }
+            }
+
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                if (!ready.isCompleted) ready.complete(false)
+            }
+        })
+    }
+
+    suspend fun awaitReady(timeoutMs: Long = 15000): Boolean {
+        return try {
+            kotlinx.coroutines.withTimeout(timeoutMs) { ready.await() }
+        } catch (_: Exception) { false }
+    }
+
+    fun sendAudioPcm(pcm: ShortArray) {
+        if (!ready.isCompleted || ready.getCompleted() != true) return
+        val ws = socket ?: return
+        if (pcm.isEmpty()) return
+        val bb = ByteBuffer.allocate(pcm.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        pcm.forEach { bb.putShort(it) }
+        val payload = buildJsonObject {
+            putJsonObject("realtimeInput") {
+                putJsonObject("audio") {
+                    put("data", Base64.encodeToString(bb.array(), Base64.NO_WRAP))
+                    put("mimeType", "audio/pcm;rate=16000")
+                }
             }
         }
+        ws.send(payload.toString())
+    }
 
-        try {
-            val req = Request.Builder()
-                .url(url)
-                .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
-                .build()
-
-            val res = okHttpClient.newCall(req).execute()
-            val body = res.body?.string().orEmpty()
-
-            if (!res.isSuccessful) {
-                return@withContext Result.failure(IllegalStateException("فشل التفريغ الصوتي: $body"))
-            }
-
-            val parsed = json.parseToJsonElement(body).jsonObject
-            val candidate = parsed["candidates"]?.jsonArray?.firstOrNull()?.jsonObject
-            val transcribedText = candidate?.get("content")?.jsonObject?.get("parts")?.jsonArray?.firstOrNull()
-                ?.jsonObject?.get("text")?.jsonPrimitive?.content.orEmpty().trim()
-
-            Result.success(transcribedText)
-        } catch (e: Exception) {
-            Result.failure(e)
-        }
+    fun close() {
+        if (!ready.isCompleted) ready.complete(false)
+        runCatching { socket?.close(1000, "close") }
+        socket = null
+        runCatching { client?.dispatcher?.executorService?.shutdown() }
+        client = null
     }
 }

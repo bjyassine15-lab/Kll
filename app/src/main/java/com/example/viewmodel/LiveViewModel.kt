@@ -6,17 +6,17 @@ import androidx.lifecycle.viewModelScope
 import com.example.StudyMindApplication
 import com.example.ai.LiveState
 import com.example.audio.PcmAudioCapture
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 class LiveViewModel(application: Application) : AndroidViewModel(application) {
-
     private val app = application as StudyMindApplication
     private val liveManager = app.liveManager
     private val orchestrator = app.orchestrator
-    private val audioCapture = PcmAudioCapture()
+    private val audioCapture = PcmAudioCapture(sampleRate = 16000)
 
     val liveState: StateFlow<LiveState> = liveManager.liveState
     val transcript: StateFlow<String> = liveManager.transcriptFlow
@@ -26,15 +26,13 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
     val isMuted: StateFlow<Boolean> = _isMuted.asStateFlow()
 
     fun startLiveSession() {
-        viewModelScope.launch {
-            val studentContext = orchestrator.getStudentStructuredContext()
-            liveManager.connect(viewModelScope, studentContext)
+        viewModelScope.launch(Dispatchers.IO) {
+            val context = orchestrator.getStudentStructuredContext()
+            liveManager.connect(viewModelScope, context)
+            if (!liveManager.awaitReady()) return@launch
 
-            // Start capturing microphone audio to feed into Gemini Live
             audioCapture.start(viewModelScope) { pcm ->
-                if (!_isMuted.value && liveState.value == LiveState.LISTENING) {
-                    liveManager.sendAudioPcm(pcm)
-                }
+                if (!_isMuted.value) liveManager.sendAudioPcm(pcm)
             }
         }
     }
@@ -53,7 +51,7 @@ class LiveViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
-        super.onCleared()
         endLiveSession()
+        super.onCleared()
     }
 }

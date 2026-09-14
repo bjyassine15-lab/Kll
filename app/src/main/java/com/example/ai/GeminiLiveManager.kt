@@ -5,30 +5,36 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.util.Base64
 import com.example.BuildConfig
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
-import okhttp3.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 
-enum class LiveState {
-    DISCONNECTED,
-    CONNECTING,
-    LISTENING,
-    THINKING,
-    SPEAKING,
-    ERROR
+public enum class LiveState {
+    DISCONNECTED, CONNECTING, LISTENING, THINKING, SPEAKING, ERROR
 }
 
 class GeminiLiveManager(
     private val customApiKey: String? = null,
     private val onToolCall: (suspend (name: String, args: Map<String, String>) -> String)? = null
-) {
+) : Closeable {
+
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -45,309 +51,352 @@ class GeminiLiveManager(
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
     private var webSocket: WebSocket? = null
+    private var client: OkHttpClient? = null
     private var scope: CoroutineScope? = null
     private var audioTrack: AudioTrack? = null
     private var playbackJob: Job? = null
     private val audioQueue = ConcurrentLinkedQueue<ByteArray>()
+    private var setupReady = CompletableDeferred<Boolean>()
+    @Volatile private var closed = false
 
-    private fun getApiKey(): String {
-        val key = customApiKey?.takeIf { it.isNotBlank() && it != "GEMINI_API_KEY_HERE" }
-            ?: BuildConfig.GEMINI_API_KEY
-        return if (key.isBlank() || key == "GEMINI_API_KEY_HERE") "" else key
+    private fun apiKey(): String {
+        val custom = customApiKey?.takeIf { it.isNotBlank() && it != "GEMINI_API_KEY_HERE" }
+        val key = custom ?: BuildConfig.GEMINI_API_KEY
+        return if (key == "GEMINI_API_KEY_HERE") "" else key.trim()
     }
 
-    fun connect(
-        coroutineScope: CoroutineScope,
-        studentContext: String = ""
-    ) {
-        if (_liveState.value != LiveState.DISCONNECTED && _liveState.value != LiveState.ERROR) {
-            return
-        }
-
-        val apiKey = getApiKey()
-        if (apiKey.isBlank()) {
+    fun connect(coroutineScope: CoroutineScope, studentContext: String = "") {
+        if (_liveState.value == LiveState.CONNECTING || _liveState.value == LiveState.LISTENING || _liveState.value == LiveState.SPEAKING || _liveState.value == LiveState.THINKING) return
+        val key = apiKey()
+        if (key.isBlank()) {
             _liveState.value = LiveState.ERROR
-            _errorMessage.value = "مفتاح Gemini API غير مهيأ في الإعدادات."
+            _errorMessage.value = "مفتاح Gemini API غير مهيأ."
             return
         }
 
         scope = coroutineScope
-        _liveState.value = LiveState.CONNECTING
+        closed = false
+        setupReady = CompletableDeferred()
         _errorMessage.value = null
-        initAudioTrack()
+        _liveState.value = LiveState.CONNECTING
+        initAudioPlayback()
 
-        val wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=$apiKey"
-
-        val client = OkHttpClient.Builder()
+        val wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$key"
+        client = OkHttpClient.Builder()
             .readTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(15, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
             .build()
 
         val request = Request.Builder().url(wsUrl).build()
-
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                _liveState.value = LiveState.LISTENING
-                sendSetupMessage(webSocket, studentContext)
+        webSocket = client!!.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(ws: WebSocket, response: Response) {
+                sendSetup(ws, studentContext)
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                handleIncomingServerMessage(webSocket, text)
+            override fun onMessage(ws: WebSocket, text: String) {
+                handleServerMessage(ws, text)
             }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                _liveState.value = LiveState.ERROR
-                _errorMessage.value = "انقطع اتصال المساعد الصوتي: ${t.localizedMessage}"
-                cleanup()
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                if (!closed) {
+                    if (!setupReady.isCompleted) setupReady.complete(false)
+                    _liveState.value = LiveState.ERROR
+                    _errorMessage.value = "انقطع اتصال Gemini Live: ${t.localizedMessage ?: "خطأ غير معروف"}"
+                    cleanup(false)
+                }
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                _liveState.value = LiveState.DISCONNECTED
-                cleanup()
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                if (!setupReady.isCompleted) setupReady.complete(false)
+                if (!closed) _liveState.value = LiveState.DISCONNECTED
+                cleanup(false)
             }
         })
     }
 
-    private fun initAudioTrack() {
-        val sampleRate = 24000 // Gemini Live standard audio output is 24kHz PCM
-        val bufferSize = AudioTrack.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        ) * 2
+    suspend fun awaitReady(timeoutMs: Long = 15_000): Boolean {
+        val waiter = scope?.launch { delay(timeoutMs) }
+        return try {
+            kotlinx.coroutines.withTimeout(timeoutMs) { setupReady.await() }
+        } catch (_: Exception) {
+            false
+        } finally {
+            waiter?.cancel()
+        }
+    }
 
-        audioTrack = AudioTrack.Builder()
+    private fun initAudioPlayback() {
+        val rate = 24000
+        val minBuffer = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuffer <= 0) return
+        val track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
             .setAudioFormat(
                 AudioFormat.Builder()
-                    .setSampleRate(sampleRate)
+                    .setSampleRate(rate)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .build()
             )
-            .setBufferSizeInBytes(bufferSize)
+            .setBufferSizeInBytes(minBuffer * 2)
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
-
-        audioTrack?.play()
-
-        playbackJob = scope?.launch(Dispatchers.IO) {
-            while (isActive) {
+        audioTrack = track
+        track.play()
+        playbackJob = scope?.launch(kotlinx.coroutines.Dispatchers.IO) {
+            while (isActive && !closed) {
                 val chunk = audioQueue.poll()
-                if (chunk != null && audioTrack != null) {
-                    audioTrack?.write(chunk, 0, chunk.size)
-                } else {
-                    delay(10)
-                }
+                if (chunk != null) {
+                    runCatching { track.write(chunk, 0, chunk.size) }
+                } else delay(8)
             }
         }
     }
 
-    private fun sendSetupMessage(ws: WebSocket, studentContext: String) {
-        val setupJson = buildJsonObject {
+    private fun sendSetup(ws: WebSocket, studentContext: String) {
+        val setup = buildJsonObject {
             putJsonObject("setup") {
                 put("model", "models/gemini-3.1-flash-live-preview")
                 putJsonObject("generationConfig") {
-                    putJsonArray("responseModalities") {
-                        add("AUDIO")
-                    }
+                    putJsonArray("responseModalities") { add("AUDIO") }
                     putJsonObject("speechConfig") {
                         putJsonObject("voiceConfig") {
-                            putJsonObject("prebuiltVoiceConfig") {
-                                put("voiceName", "Puck")
-                            }
+                            putJsonObject("prebuiltVoiceConfig") { put("voiceName", "Puck") }
                         }
                     }
                 }
                 putJsonObject("systemInstruction") {
                     putJsonArray("parts") {
                         addJsonObject {
-                            put(
-                                "text",
-                                """
-                                أنت "StudyMind" - المساعد الدراسي الصوتي الذكي اللحظي لطالب تونسي.
-                                - تتحدث باللهجة التونسية العفوية مع العربية الفصحى الواضحة والفرنسية للمصطلحات العلمية.
-                                - ردودك الصوتية مختصرة، دافئة، مباشرة ومفيدة (1-3 جمل في أغلب الأحيان لتناسب المحادثة الصوتية).
-                                - إذا طلب الطالب تذكيراً، امتحاناً، مهمة، أو خطة، نفذ الأداة المناسبة فوراً وأخبره بذلك بصوتك.
-                                
+                            put("text", """
+                                أنت StudyMind، مساعد دراسي شخصي لطالب تونسي.
+                                افهم العربية التونسية والفرنسية والمزج بينهما.
+                                نفّذ الأدوات فعليًا عند طلب إنشاء امتحان أو مهمة أو تذكير أو نقطة ضعف أو خطة.
+                                لا تخترع بيانات دراسية غير موجودة.
                                 سياق الطالب الحالي:
                                 $studentContext
-                                """.trimIndent()
-                            )
+                            """.trimIndent())
+                        }
+                    }
+                }
+                putJsonArray("tools") {
+                    addJsonObject {
+                        putJsonArray("functionDeclarations") {
+                            add(createReminderDeclaration())
+                            add(createExamDeclaration())
+                            add(createTaskDeclaration())
+                            add(addWeakAreaDeclaration())
+                            add(createStudyPlanDeclaration())
+                            add(savePreferenceDeclaration())
                         }
                     }
                 }
             }
         }
-        ws.send(setupJson.toString())
+        ws.send(setup.toString())
     }
 
-    private fun handleIncomingServerMessage(ws: WebSocket, text: String) {
-        try {
-            val root = json.parseToJsonElement(text).jsonObject
-            val serverContent = root["serverContent"]?.jsonObject
+    private fun stringProp(description: String) = buildJsonObject {
+        put("type", "string")
+        put("description", description)
+    }
 
-            if (serverContent != null) {
-                val interrupted = serverContent["interrupted"]?.jsonPrimitive?.booleanOrNull ?: false
-                if (interrupted) {
-                    // Interrupt speech immediately!
-                    audioQueue.clear()
-                    try {
-                        audioTrack?.pause()
-                        audioTrack?.flush()
-                        audioTrack?.play()
-                    } catch (_: Exception) {}
-                    _liveState.value = LiveState.LISTENING
-                }
+    private fun objectSchema(properties: JsonObject, required: List<String>) = buildJsonObject {
+        put("type", "object")
+        put("properties", properties)
+        putJsonArray("required") { required.forEach { add(it) } }
+    }
 
-                val modelTurn = serverContent["modelTurn"]?.jsonObject
-                if (modelTurn != null) {
-                    _liveState.value = LiveState.SPEAKING
-                    val parts = modelTurn["parts"]?.jsonArray
-                    parts?.forEach { partEl ->
-                        val part = partEl.jsonObject
-                        // Check for audio data
-                        val inlineData = part["inlineData"]?.jsonObject
-                        if (inlineData != null) {
-                            val mime = inlineData["mimeType"]?.jsonPrimitive?.content.orEmpty()
-                            val data = inlineData["data"]?.jsonPrimitive?.content.orEmpty()
-                            if (mime.contains("audio/pcm") && data.isNotBlank()) {
-                                val pcmBytes = Base64.decode(data, Base64.DEFAULT)
-                                audioQueue.add(pcmBytes)
-                            }
-                        }
-                        // Check for text transcript
-                        part["text"]?.jsonPrimitive?.contentOrNull?.let { t ->
-                            if (t.isNotBlank()) {
-                                _transcriptFlow.value = t
-                            }
-                        }
-                    }
-                }
+    private fun decl(name: String, description: String, schema: JsonObject) = buildJsonObject {
+        put("name", name)
+        put("description", description)
+        put("parameters", schema)
+    }
 
-                val turnComplete = serverContent["turnComplete"]?.jsonPrimitive?.booleanOrNull ?: false
-                if (turnComplete) {
-                    _liveState.value = LiveState.LISTENING
-                }
+    private fun createReminderDeclaration() = decl(
+        "createReminder",
+        "Create a real reminder in StudyMind.",
+        objectSchema(buildJsonObject {
+            put("title", stringProp("Reminder title"))
+            put("message", stringProp("Notification message"))
+            put("dateTime", stringProp("Local date/time YYYY-MM-DD HH:mm"))
+        }, listOf("title", "message", "dateTime"))
+    )
+
+    private fun createExamDeclaration() = decl(
+        "createExam",
+        "Create an exam record and refresh study planning.",
+        objectSchema(buildJsonObject {
+            put("subjectName", stringProp("Subject"))
+            put("title", stringProp("Exam title"))
+            put("date", stringProp("YYYY-MM-DD"))
+            put("time", stringProp("HH:mm"))
+        }, listOf("subjectName", "title", "date"))
+    )
+
+    private fun createTaskDeclaration() = decl(
+        "createTask",
+        "Create a study task.",
+        objectSchema(buildJsonObject {
+            put("title", stringProp("Task title"))
+            put("subjectName", stringProp("Subject name"))
+            put("priority", stringProp("LOW, NORMAL, HIGH, or URGENT"))
+        }, listOf("title"))
+    )
+
+    private fun addWeakAreaDeclaration() = decl(
+        "addWeakArea",
+        "Store a weak study area.",
+        objectSchema(buildJsonObject {
+            put("subjectName", stringProp("Subject name"))
+            put("topic", stringProp("Weak topic"))
+            put("severity", stringProp("LOW, MEDIUM, or HIGH"))
+        }, listOf("subjectName", "topic"))
+    )
+
+    private fun createStudyPlanDeclaration() = decl(
+        "createStudyPlan",
+        "Generate or refresh a daily study plan.",
+        objectSchema(buildJsonObject { put("date", stringProp("YYYY-MM-DD")) }, emptyList())
+    )
+
+    private fun savePreferenceDeclaration() = decl(
+        "savePreference",
+        "Save a student preference such as homeArrivalTime or sleepTime.",
+        objectSchema(buildJsonObject {
+            put("key", stringProp("Preference key"))
+            put("value", stringProp("Preference value"))
+        }, listOf("key", "value"))
+    )
+
+    private fun handleServerMessage(ws: WebSocket, raw: String) {
+        runCatching {
+            val root = json.parseToJsonElement(raw).jsonObject
+            if (root["setupComplete"] != null) {
+                if (!setupReady.isCompleted) setupReady.complete(true)
+                _liveState.value = LiveState.LISTENING
+                return@runCatching
             }
 
-            // Check for tool call
-            val toolCall = root["toolCall"]?.jsonObject
-            if (toolCall != null) {
+            root["toolCall"]?.jsonObject?.let { toolCall ->
                 _liveState.value = LiveState.THINKING
-                val functionCalls = toolCall["functionCalls"]?.jsonArray
-                functionCalls?.forEach { fcEl ->
-                    val fc = fcEl.jsonObject
-                    val callId = fc["id"]?.jsonPrimitive?.content.orEmpty()
-                    val name = fc["name"]?.jsonPrimitive?.content.orEmpty()
-                    val argsObj = fc["args"]?.jsonObject
-                    val argsMap = mutableMapOf<String, String>()
-                    argsObj?.forEach { (k, v) ->
-                        argsMap[k] = v.jsonPrimitive.contentOrNull ?: v.toString()
+                val calls = toolCall["functionCalls"]?.jsonArray.orEmpty()
+                calls.forEach { el ->
+                    val obj = el.jsonObject
+                    val id = obj["id"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    val name = obj["name"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    val args = mutableMapOf<String, String>()
+                    obj["args"]?.jsonObject?.forEach { (k, v) ->
+                        args[k] = v.jsonPrimitive.contentOrNull ?: v.toString()
                     }
-
-                    scope?.launch(Dispatchers.IO) {
-                        val result = onToolCall?.invoke(name, argsMap) ?: "تمت المعالجة بنجاح"
-                        sendToolResponse(ws, callId, name, result)
+                    scope?.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        val result = try {
+                            onToolCall?.invoke(name, args) ?: "ok"
+                        } catch (e: Exception) {
+                            "error: ${e.localizedMessage ?: "tool failed"}"
+                        }
+                        sendToolResponse(ws, id, name, result)
                     }
                 }
             }
-        } catch (_: Exception) {
-            // Non-fatal parse issue
+
+            val content = root["serverContent"]?.jsonObject
+            if (content != null) {
+                if (content["interrupted"]?.jsonPrimitive?.booleanOrNull == true) {
+                    audioQueue.clear()
+                    runCatching { audioTrack?.pause(); audioTrack?.flush(); audioTrack?.play() }
+                }
+
+                content["modelTurn"]?.jsonObject?.get("parts")?.jsonArray?.forEach { p ->
+                    val part = p.jsonObject
+                    val inline = part["inlineData"]?.jsonObject
+                    if (inline != null) {
+                        val mime = inline["mimeType"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                        val data = inline["data"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                        if (mime.startsWith("audio/pcm") && data.isNotBlank()) {
+                            audioQueue.add(Base64.decode(data, Base64.DEFAULT))
+                            _liveState.value = LiveState.SPEAKING
+                        }
+                    }
+                }
+
+                content["outputTranscription"]?.jsonObject?.let {
+                    val t = it["text"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                    if (t.isNotBlank()) _transcriptFlow.value = t
+                }
+
+                if (content["turnComplete"]?.jsonPrimitive?.booleanOrNull == true) {
+                    _liveState.value = LiveState.LISTENING
+                }
+            }
         }
     }
 
-    private fun sendToolResponse(ws: WebSocket, callId: String, name: String, resultString: String) {
-        val responseJson = buildJsonObject {
+    private fun sendToolResponse(ws: WebSocket, id: String, name: String, result: String) {
+        val payload = buildJsonObject {
             putJsonObject("toolResponse") {
                 putJsonArray("functionResponses") {
                     addJsonObject {
-                        put("id", callId)
-                        putJsonObject("response") {
-                            putJsonObject("output") {
-                                put("status", "success")
-                                put("result", resultString)
-                            }
-                        }
+                        put("name", name)
+                        put("id", id)
+                        putJsonObject("response") { put("result", result) }
                     }
                 }
             }
         }
-        ws.send(responseJson.toString())
+        ws.send(payload.toString())
     }
 
-    /**
-     * Sends a 16kHz PCM audio chunk from microphone
-     */
     fun sendAudioPcm(pcm: ShortArray) {
+        if (!setupReady.isCompleted || setupReady.getCompleted() != true) return
         val ws = webSocket ?: return
-        if (_liveState.value == LiveState.DISCONNECTED || _liveState.value == LiveState.ERROR) return
-
-        val byteBuffer = ByteBuffer.allocate(pcm.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-        for (sample in pcm) {
-            byteBuffer.putShort(sample)
-        }
-        val base64Audio = Base64.encodeToString(byteBuffer.array(), Base64.NO_WRAP)
-
-        val chunkJson = buildJsonObject {
+        if (_liveState.value == LiveState.ERROR || _liveState.value == LiveState.DISCONNECTED) return
+        val bb = ByteBuffer.allocate(pcm.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        pcm.forEach { bb.putShort(it) }
+        val payload = buildJsonObject {
             putJsonObject("realtimeInput") {
-                putJsonArray("mediaChunks") {
-                    addJsonObject {
-                        put("mimeType", "audio/pcm;rate=16000")
-                        put("data", base64Audio)
-                    }
+                putJsonObject("audio") {
+                    put("data", Base64.encodeToString(bb.array(), Base64.NO_WRAP))
+                    put("mimeType", "audio/pcm;rate=16000")
                 }
             }
         }
-        ws.send(chunkJson.toString())
+        ws.send(payload.toString())
     }
 
-    /**
-     * Sends a real-time text message to the live assistant
-     */
     fun sendTextMessage(text: String) {
-        val ws = webSocket ?: return
-        if (text.isBlank()) return
-
+        if (text.isBlank() || !setupReady.isCompleted || setupReady.getCompleted() != true) return
+        webSocket?.send(buildJsonObject {
+            putJsonObject("realtimeInput") { put("text", text) }
+        }.toString())
         _liveState.value = LiveState.THINKING
-        val messageJson = buildJsonObject {
-            putJsonObject("clientContent") {
-                putJsonArray("turns") {
-                    addJsonObject {
-                        put("role", "user")
-                        putJsonArray("parts") {
-                            addJsonObject { put("text", text) }
-                        }
-                    }
-                }
-                put("turnComplete", true)
-            }
-        }
-        ws.send(messageJson.toString())
     }
 
     fun disconnect() {
+        closed = true
+        if (!setupReady.isCompleted) setupReady.complete(false)
+        runCatching { webSocket?.close(1000, "user") }
+        cleanup(true)
         _liveState.value = LiveState.DISCONNECTED
-        try {
-            webSocket?.close(1000, "User disconnected")
-        } catch (_: Exception) {}
-        cleanup()
     }
 
-    private fun cleanup() {
+    private fun cleanup(closeClient: Boolean) {
         webSocket = null
         audioQueue.clear()
         playbackJob?.cancel()
         playbackJob = null
-        try {
-            audioTrack?.stop()
-            audioTrack?.release()
-        } catch (_: Exception) {}
+        runCatching { audioTrack?.pause(); audioTrack?.flush(); audioTrack?.release() }
         audioTrack = null
+        if (closeClient) {
+            runCatching { client?.dispatcher?.executorService?.shutdown() }
+            client = null
+        }
     }
+
+    override fun close() = disconnect()
 }

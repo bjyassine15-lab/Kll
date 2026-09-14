@@ -5,16 +5,16 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.StudyMindApplication
 import com.example.data.local.entities.LessonRecord
-import com.example.data.local.entities.Subject
 import com.example.data.local.entities.Teacher
+import com.example.data.local.entities.Subject
 import com.example.services.ClassRecordingService
 import com.example.transcription.SpeakerType
 import com.example.transcription.TranscriptSegment
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 class ClassViewModel(application: Application) : AndroidViewModel(application) {
-
     private val app = application as StudyMindApplication
     private val coordinator = app.lessonCoordinator
     private val repository = app.repository
@@ -32,18 +32,18 @@ class ClassViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startClass(subjectName: String, teacher: Teacher?) {
         viewModelScope.launch {
-            val voiceProfile = teacher?.id?.let { repository.getVoiceProfile(it) }
-            val started = coordinator.startListening(
+            val voice = teacher?.id?.let { repository.getVoiceProfile(it) }
+            val ready = coordinator.startListening(
                 scope = viewModelScope,
                 subjectName = subjectName,
-                teacherName = teacher?.name ?: "",
-                teacherVoiceBytes = voiceProfile?.profileBytes
+                teacherName = teacher?.name.orEmpty(),
+                teacherVoiceBytes = voice?.profileBytes
             )
-            if (started) {
+            if (ready) {
                 ClassRecordingService.startService(
-                    context = app,
-                    subject = subjectName,
-                    teacher = teacher?.name ?: ""
+                    app,
+                    subjectName,
+                    teacher?.name.orEmpty()
                 )
             }
         }

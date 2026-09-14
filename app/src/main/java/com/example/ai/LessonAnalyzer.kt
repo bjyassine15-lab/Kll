@@ -139,7 +139,7 @@ class LessonAnalyzer(
             return@withContext Result.failure(IllegalStateException("مفتاح Gemini API غير مهيأ."))
         }
 
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=$apiKey"
 
         val transcriptText = segments.joinToString("\n") { seg ->
             val speakerLabel = when (seg.speakerType) {

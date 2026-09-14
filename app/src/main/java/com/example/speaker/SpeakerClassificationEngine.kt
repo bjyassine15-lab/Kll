@@ -1,7 +1,8 @@
 package com.example.speaker
 
 import com.example.transcription.SpeakerType
-import java.util.LinkedList
+import java.util.ArrayDeque
+import kotlin.math.max
 
 data class SpeakerClassification(
     val type: SpeakerType,
@@ -10,13 +11,15 @@ data class SpeakerClassification(
 )
 
 class SpeakerClassificationEngine(
-    private val windowSize: Int = 12,
-    private val teacherMatchThreshold: Float = 0.55f,
-    private val studentEnergyThreshold: Double = 180.0
+    private val teacherEnterThreshold: Float = 0.62f,
+    private val teacherStayThreshold: Float = 0.52f,
+    private val studentExitThreshold: Float = 0.30f,
+    private val historySize: Int = 10,
+    private val minStudentFrames: Int = 5
 ) {
-    private val scoreHistory = LinkedList<Float>()
-    private var consecutiveTeacherFrames = 0
-    private var consecutiveStudentFrames = 0
+    private val scores = ArrayDeque<Float>()
+    private var teacherFrames = 0
+    private var lowTeacherFrames = 0
 
     fun classify(
         isVoiceActive: Boolean,
@@ -24,75 +27,50 @@ class SpeakerClassificationEngine(
         rmsEnergy: Double
     ): SpeakerClassification {
         if (!isVoiceActive) {
-            scoreHistory.clear()
-            consecutiveTeacherFrames = 0
-            consecutiveStudentFrames = 0
+            resetWindow()
+            return SpeakerClassification(SpeakerType.NOISE, 0.92f, 0f)
+        }
+
+        val score = eagleScores?.firstOrNull()
+        if (score == null) {
+            return SpeakerClassification(SpeakerType.UNKNOWN, 0.25f, 0f)
+        }
+
+        scores.addLast(score)
+        while (scores.size > historySize) scores.removeFirst()
+        val smoothed = scores.average().toFloat()
+
+        if (smoothed >= teacherEnterThreshold) {
+            teacherFrames++
+            lowTeacherFrames = 0
             return SpeakerClassification(
-                type = SpeakerType.NOISE,
-                confidence = 0.9f,
-                teacherMatchScore = 0f
+                SpeakerType.TEACHER,
+                (0.65f + smoothed * 0.35f).coerceAtMost(0.99f),
+                smoothed
             )
         }
 
-        val currentScore = eagleScores?.firstOrNull() ?: 0f
-        scoreHistory.addLast(currentScore)
-        if (scoreHistory.size > windowSize) {
-            scoreHistory.removeFirst()
+        if (smoothed >= teacherStayThreshold && teacherFrames > 0) {
+            teacherFrames++
+            lowTeacherFrames = 0
+            return SpeakerClassification(SpeakerType.TEACHER, smoothed, smoothed)
         }
 
-        // Rolling weighted average - recent frames get higher weight
-        var weightedSum = 0f
-        var weightTotal = 0f
-        scoreHistory.forEachIndexed { index, score ->
-            val weight = (index + 1).toFloat()
-            weightedSum += score * weight
-            weightTotal += weight
-        }
-        val smoothedScore = if (weightTotal > 0f) weightedSum / weightTotal else 0f
+        teacherFrames = max(0, teacherFrames - 1)
+        lowTeacherFrames++
 
-        return when {
-            smoothedScore >= teacherMatchThreshold -> {
-                consecutiveTeacherFrames++
-                consecutiveStudentFrames = 0
-                val confidence = (smoothedScore * (1f + (consecutiveTeacherFrames.coerceAtMost(5) * 0.05f))).coerceAtMost(0.98f)
-                SpeakerClassification(
-                    type = SpeakerType.TEACHER,
-                    confidence = confidence,
-                    teacherMatchScore = smoothedScore
-                )
-            }
-            smoothedScore in 0.35f..teacherMatchThreshold -> {
-                consecutiveTeacherFrames = 0
-                consecutiveStudentFrames = 0
-                SpeakerClassification(
-                    type = SpeakerType.UNKNOWN,
-                    confidence = 0.5f,
-                    teacherMatchScore = smoothedScore
-                )
-            }
-            rmsEnergy > studentEnergyThreshold -> {
-                consecutiveStudentFrames++
-                consecutiveTeacherFrames = 0
-                val confidence = (0.7f + (consecutiveStudentFrames.coerceAtMost(5) * 0.04f)).coerceAtMost(0.92f)
-                SpeakerClassification(
-                    type = SpeakerType.STUDENT,
-                    confidence = confidence,
-                    teacherMatchScore = smoothedScore
-                )
-            }
-            else -> {
-                SpeakerClassification(
-                    type = SpeakerType.UNKNOWN,
-                    confidence = 0.4f,
-                    teacherMatchScore = smoothedScore
-                )
-            }
+        if (smoothed < studentExitThreshold && lowTeacherFrames >= minStudentFrames && rmsEnergy > 180.0) {
+            return SpeakerClassification(SpeakerType.STUDENT, 0.55f, smoothed)
         }
+
+        return SpeakerClassification(SpeakerType.UNKNOWN, 0.35f, smoothed)
     }
 
-    fun reset() {
-        scoreHistory.clear()
-        consecutiveTeacherFrames = 0
-        consecutiveStudentFrames = 0
+    private fun resetWindow() {
+        scores.clear()
+        teacherFrames = 0
+        lowTeacherFrames = 0
     }
+
+    fun reset() = resetWindow()
 }
