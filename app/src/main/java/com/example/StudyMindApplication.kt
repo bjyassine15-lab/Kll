@@ -35,6 +35,12 @@ class StudyMindApplication : Application() {
     lateinit var lessonCoordinator: LessonRecordingCoordinator
         private set
 
+    lateinit var scheduleWatcher: com.example.schedule.ScheduleWatcher
+        private set
+
+    lateinit var toolExecutor: com.example.ai.tools.StudyMindToolExecutor
+        private set
+
     private val appScope = CoroutineScope(Dispatchers.IO)
 
     override fun onCreate() {
@@ -56,7 +62,29 @@ class StudyMindApplication : Application() {
         reminderScheduler = ReminderScheduler(this)
         val plannerEngine = StudyPlannerEngine(repository)
 
-        // 5. Initialize AI Providers
+        // 5. Schedule Watcher
+        scheduleWatcher = com.example.schedule.ScheduleWatcher(this, repository, reminderScheduler)
+        appScope.launch {
+            scheduleWatcher.refreshCurrentAndNextLessons()
+            scheduleWatcher.syncDailyClassReminders()
+        }
+
+        // 6. Tool Executor
+        toolExecutor = com.example.ai.tools.StudyMindToolExecutor(
+            context = this,
+            repository = repository,
+            reminderScheduler = reminderScheduler,
+            plannerEngine = plannerEngine,
+            onStartClassListening = { subject, teacher ->
+                // Start class recording service
+                com.example.services.ClassRecordingService.startService(this, subject, teacher)
+            },
+            onStopClassListening = {
+                com.example.services.ClassRecordingService.stopService(this)
+            }
+        )
+
+        // 7. Initialize AI Providers
         val geminiApiKey = BuildConfig.GEMINI_API_KEY
         val picovoiceKey = BuildConfig.PICOVOICE_ACCESS_KEY
 
@@ -66,7 +94,7 @@ class StudyMindApplication : Application() {
         liveManager = GeminiLiveManager(
             customApiKey = geminiApiKey,
             onToolCall = { name, args ->
-                orchestrator.executeToolCall(name, args)
+                toolExecutor.execute(name, args)
             }
         )
 
@@ -77,7 +105,7 @@ class StudyMindApplication : Application() {
             geminiApiKey = geminiApiKey
         )
 
-        // 6. Central Orchestrator
+        // 8. Central Orchestrator
         orchestrator = StudyMindOrchestrator(
             context = this,
             repository = repository,
@@ -86,7 +114,8 @@ class StudyMindApplication : Application() {
             liveManager = liveManager,
             reminderScheduler = reminderScheduler,
             plannerEngine = plannerEngine,
-            lessonCoordinator = lessonCoordinator
+            lessonCoordinator = lessonCoordinator,
+            toolExecutor = toolExecutor
         )
     }
 }

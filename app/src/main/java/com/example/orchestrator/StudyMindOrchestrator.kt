@@ -6,6 +6,7 @@ import com.example.ai.GeminiLiveManager
 import com.example.ai.GeminiTextProvider
 import com.example.ai.GeminiVisionProvider
 import com.example.ai.NotebookVerificationResult
+import com.example.ai.tools.StudyMindToolExecutor
 import com.example.data.local.entities.*
 import com.example.data.repository.StudyMindRepository
 import com.example.lesson.LessonRecordingCoordinator
@@ -27,7 +28,8 @@ class StudyMindOrchestrator(
     val liveManager: GeminiLiveManager,
     val reminderScheduler: ReminderScheduler,
     val plannerEngine: StudyPlannerEngine,
-    val lessonCoordinator: LessonRecordingCoordinator
+    val lessonCoordinator: LessonRecordingCoordinator,
+    val toolExecutor: StudyMindToolExecutor
 ) {
     suspend fun getStudentStructuredContext(): String = withContext(Dispatchers.IO) {
         val profile = repository.getStudentProfileSync()
@@ -117,124 +119,7 @@ class StudyMindOrchestrator(
     }
 
     suspend fun executeToolCall(name: String, args: Map<String, String>): String = withContext(Dispatchers.IO) {
-        when (name) {
-            "createExam" -> {
-                val subjectName = args["subjectName"] ?: "مادة غير محددة"
-                val title = args["title"] ?: "فرض مراقبة"
-                val dateStr = args["date"] ?: getTodayDateString()
-                val timeStr = args["time"] ?: "08:00"
-
-                val epoch = parseDateToEpoch(dateStr, timeStr)
-                repository.insertExam(
-                    Exam(
-                        subjectId = 0L,
-                        subjectName = subjectName,
-                        title = title,
-                        examDate = epoch,
-                        time = timeStr
-                    )
-                )
-
-                // Schedule automated reminder 1 day before the exam
-                val reminderTime = epoch - (24 * 60 * 60 * 1000)
-                if (reminderTime > System.currentTimeMillis()) {
-                    val remId = repository.insertReminder(
-                        Reminder(
-                            title = "تذكير بفرض $subjectName",
-                            message = "غداً لديك $title في مادة $subjectName! احرص على مراجعة النقاط الأساسية.",
-                            triggerTimeMillis = reminderTime,
-                            reminderType = "CLASS_RELATED"
-                        )
-                    )
-                    reminderScheduler.scheduleReminder(
-                        reminderId = remId,
-                        title = "تذكير بفرض $subjectName",
-                        message = "غداً لديك $title في مادة $subjectName!",
-                        triggerTimeMillis = reminderTime
-                    )
-                }
-
-                // Re-evaluate study plan
-                plannerEngine.generateDailyPlan()
-
-                "تم تسجيل موعد فرض $subjectName ($title) بتاريخ $dateStr بنجاح وجدولة تذكير وتحديث خطة المراجعة."
-            }
-            "createReminder" -> {
-                val title = args["title"] ?: "تذكير دراسي"
-                val message = args["message"] ?: ""
-                val dateTimeStr = args["dateTime"] ?: ""
-
-                val triggerEpoch = parseDateTimeToEpoch(dateTimeStr)
-                val remId = repository.insertReminder(
-                    Reminder(
-                        title = title,
-                        message = message,
-                        triggerTimeMillis = triggerEpoch,
-                        reminderType = "ONE_TIME"
-                    )
-                )
-                reminderScheduler.scheduleReminder(
-                    reminderId = remId,
-                    title = title,
-                    message = message,
-                    triggerTimeMillis = triggerEpoch
-                )
-
-                "تم ضبط المنبه والتذكير لـ '$title' في الوقت المحدد."
-            }
-            "createTask" -> {
-                val title = args["title"] ?: "مهمة جديدة"
-                val subject = args["subjectName"] ?: ""
-                val priority = args["priority"] ?: "NORMAL"
-
-                repository.insertTask(
-                    Task(
-                        title = title,
-                        subjectName = subject,
-                        priority = priority,
-                        source = "CONVERSATION"
-                    )
-                )
-                "تمت إضافة المهمة '$title' إلى قائمتك الدراسية."
-            }
-            "addWeakArea" -> {
-                val subject = args["subjectName"] ?: "مادة عامة"
-                val topic = args["topic"] ?: ""
-                val severity = args["severity"] ?: "MEDIUM"
-
-                repository.insertWeakArea(
-                    WeakArea(
-                        subjectId = 0L,
-                        subjectName = subject,
-                        topic = topic,
-                        severity = severity,
-                        detectedFrom = "CONVERSATION"
-                    )
-                )
-                plannerEngine.generateDailyPlan()
-                "تم تسجيل نقطة الضعف في ($subject - $topic) وتخصيص جلسة تقوية لها في جدول المذاكرة."
-            }
-            "createStudyPlan" -> {
-                val targetDate = args["date"] ?: getTodayDateString()
-                val plan = plannerEngine.generateDailyPlan(targetDate)
-                "تم إنشاء خطة المذاكرة بنجاح: ${plan.explanation}"
-            }
-            "savePreference" -> {
-                val key = args["key"] ?: ""
-                val value = args["value"] ?: ""
-                if (key == "homeArrivalTime") {
-                    val currentProfile = repository.getStudentProfileSync() ?: StudentProfile()
-                    repository.saveProfile(currentProfile.copy(homeArrivalTime = value))
-                    plannerEngine.generateDailyPlan()
-                } else if (key == "sleepTime") {
-                    val currentProfile = repository.getStudentProfileSync() ?: StudentProfile()
-                    repository.saveProfile(currentProfile.copy(sleepTime = value))
-                    plannerEngine.generateDailyPlan()
-                }
-                "تم حفظ التفضيل ($key = $value) وتحديث جدول المذاكرة وفقاً لذلك."
-            }
-            else -> "تم تنفيذ الإجراء."
-        }
+        toolExecutor.execute(name, args)
     }
 
     suspend fun importScheduleImage(bitmap: Bitmap): Result<List<ScheduleEntry>> {

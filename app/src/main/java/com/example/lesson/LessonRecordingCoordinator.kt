@@ -29,6 +29,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+data class SpeakerWindow(
+    val startMs: Long,
+    val endMs: Long,
+    val speakerType: SpeakerType,
+    val confidence: Float
+)
+
 class LessonRecordingCoordinator(
     private val context: Context,
     private val repository: StudyMindRepository,
@@ -68,6 +75,7 @@ class LessonRecordingCoordinator(
     private var latestSpeaker = SpeakerType.UNKNOWN
     private var latestSpeakerConfidence = 0f
 
+    private val recentSpeakerWindows = java.util.Collections.synchronizedList(ArrayList<SpeakerWindow>())
     private val eagleBuffer = ArrayList<Short>(4096)
 
     fun startListening(
@@ -88,6 +96,7 @@ class LessonRecordingCoordinator(
         latestSpeaker = SpeakerType.UNKNOWN
         latestSpeakerConfidence = 0f
         eagleBuffer.clear()
+        recentSpeakerWindows.clear()
 
         recognizer.close()
         if (teacherVoiceBytes != null && teacherVoiceBytes.isNotEmpty()) {
@@ -106,14 +115,48 @@ class LessonRecordingCoordinator(
             if (!transcription.awaitReady()) return@launch
             transcription.transcripts.collect { event ->
                 val elapsed = (event.atMillis - startTimeMillis).coerceAtLeast(0L)
-                val speaker = latestSpeaker
-                val confidence = latestSpeakerConfidence
-                val classified = analyzer.classifySegmentLocally(event.text, speaker)
+                val estimatedDuration = (event.text.length * 60L).coerceIn(800L, 6000L)
+                val segStart = (elapsed - estimatedDuration).coerceAtLeast(0L)
+                val segEnd = elapsed
+
+                // Match with overlapping speaker windows
+                val overlapping = synchronized(recentSpeakerWindows) {
+                    recentSpeakerWindows.filter { it.endMs >= segStart && it.startMs <= segEnd }
+                }
+
+                val (resolvedSpeaker, resolvedConfidence) = if (overlapping.isNotEmpty()) {
+                    val teacherWindows = overlapping.filter { it.speakerType == SpeakerType.TEACHER }
+                    val studentWindows = overlapping.filter { it.speakerType == SpeakerType.STUDENT }
+                    if (teacherWindows.isNotEmpty() && studentWindows.isNotEmpty()) {
+                        Pair(SpeakerType.MIXED, 0.75f)
+                    } else if (teacherWindows.isNotEmpty()) {
+                        Pair(SpeakerType.TEACHER, teacherWindows.maxOf { it.confidence })
+                    } else if (studentWindows.isNotEmpty()) {
+                        Pair(SpeakerType.STUDENT, studentWindows.maxOf { it.confidence })
+                    } else {
+                        val dominant = overlapping.groupBy { it.speakerType }.maxByOrNull { it.value.size }
+                        val spk = dominant?.key ?: SpeakerType.UNKNOWN
+                        val conf = dominant?.value?.map { it.confidence }?.average()?.toFloat() ?: 0.5f
+                        Pair(spk, conf)
+                    }
+                } else {
+                    // Timing unavailable or distant: use closest window with lower confidence
+                    val closest = synchronized(recentSpeakerWindows) {
+                        recentSpeakerWindows.minByOrNull { kotlin.math.abs(it.endMs - segEnd) }
+                    }
+                    if (closest != null) {
+                        Pair(closest.speakerType, (closest.confidence * 0.7f).coerceAtLeast(0.35f))
+                    } else {
+                        Pair(latestSpeaker, (latestSpeakerConfidence * 0.5f).coerceAtLeast(0.3f))
+                    }
+                }
+
+                val classified = analyzer.classifySegmentLocally(event.text, resolvedSpeaker)
                 val seg = TranscriptSegment(
-                    startMs = elapsed,
-                    endMs = elapsed,
-                    speakerType = speaker,
-                    speakerConfidence = confidence,
+                    startMs = segStart,
+                    endMs = segEnd,
+                    speakerType = resolvedSpeaker,
+                    speakerConfidence = resolvedConfidence,
                     language = event.language ?: detectLanguage(event.text),
                     text = event.text,
                     importance = classified.second,
@@ -145,6 +188,9 @@ class LessonRecordingCoordinator(
         val processed = preprocessor.preprocess(raw)
         val stats = preprocessor.calculateStats(processed)
         val voice = vad.processFrame(processed)
+        val nowElapsed = (System.currentTimeMillis() - startTimeMillis).coerceAtLeast(0L)
+        val frameDurationMs = (raw.size * 1000L) / 16000L
+        val windowStart = (nowElapsed - frameDurationMs).coerceAtLeast(0L)
 
         if (recognizer.isInitialized && voice) {
             eagleBuffer.addAll(processed.asList())
@@ -158,6 +204,10 @@ class LessonRecordingCoordinator(
                 latestSpeakerConfidence = classification.confidence
                 _currentSpeaker.value = classification.type
                 _teacherConfidence.value = classification.teacherMatchScore
+
+                recentSpeakerWindows.add(
+                    SpeakerWindow(windowStart, nowElapsed, classification.type, classification.confidence)
+                )
             }
         } else {
             val classification = speakerEngine.classify(voice, null, stats.rmsEnergy)
@@ -165,6 +215,16 @@ class LessonRecordingCoordinator(
             latestSpeakerConfidence = classification.confidence
             _currentSpeaker.value = classification.type
             _teacherConfidence.value = classification.teacherMatchScore
+
+            recentSpeakerWindows.add(
+                SpeakerWindow(windowStart, nowElapsed, classification.type, classification.confidence)
+            )
+        }
+
+        // Clean up old windows older than 60s
+        val cutoff = nowElapsed - 60_000L
+        synchronized(recentSpeakerWindows) {
+            recentSpeakerWindows.removeAll { it.endMs < cutoff }
         }
 
         // Send continuous audio to the dedicated Live Transcription model.

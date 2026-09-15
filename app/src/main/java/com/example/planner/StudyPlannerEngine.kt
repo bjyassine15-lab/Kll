@@ -29,13 +29,19 @@ class StudyPlannerEngine(private val repository: StudyMindRepository) {
         prettyPrint = true
     }
 
+    data class FreeInterval(val startMinutes: Int, val endMinutes: Int) {
+        val duration: Int get() = max(0, endMinutes - startMinutes)
+    }
+
     /**
-     * Generates a realistic daily study plan taking into account:
-     * - Home arrival time (e.g. 17:30)
-     * - Sleep time (e.g. 22:30)
-     * - High coefficient exams coming up soon
-     * - Weak areas needing reinforcement
+     * Generates a realistic daily study plan using actual free intervals:
+     * - Home arrival time (e.g. 17:30) + 30 min settling
+     * - Sleep time (e.g. 22:30) - 30 min wind-down
+     * - Excludes today's school/evening classes
+     * - High coefficient exams coming up soon get top priority
+     * - Severe weak areas get high priority
      * - Homework tasks
+     * - Preserves 10-minute rest breaks
      */
     suspend fun generateDailyPlan(targetDate: String = getTodayDateString()): StudyPlan {
         val profile = repository.getStudentProfileSync()
@@ -45,12 +51,33 @@ class StudyPlannerEngine(private val repository: StudyMindRepository) {
         val arrivalMinutes = timeToMinutes(arrivalTimeStr)
         val sleepMinutes = timeToMinutes(sleepTimeStr)
 
-        // Give 30 minutes to settle down after arrival
-        val startStudyMinutes = arrivalMinutes + 30
-        // Stop studying 30 minutes before sleep for wind-down
-        val endStudyMinutes = sleepMinutes - 30
+        // Settle down after arrival
+        val baseStartMinutes = arrivalMinutes + 30
+        val baseEndMinutes = sleepMinutes - 30
 
-        val totalAvailableMinutes = max(0, endStudyMinutes - startStudyMinutes)
+        // Get today's classes
+        val dayOfWeek = getDayOfWeekForDate(targetDate)
+        val todayClasses = repository.getScheduleForDay(dayOfWeek)
+
+        // Compute actual non-overlapping free intervals
+        val busyIntervals = todayClasses.map {
+            timeToMinutes(it.startTime) to timeToMinutes(it.endTime)
+        }.filter { it.second > baseStartMinutes && it.first < baseEndMinutes }
+        .sortedBy { it.first }
+
+        val freeIntervals = mutableListOf<FreeInterval>()
+        var cursor = baseStartMinutes
+
+        for ((bStart, bEnd) in busyIntervals) {
+            val clampedStart = max(cursor, bStart)
+            if (clampedStart > cursor + 15) {
+                freeIntervals.add(FreeInterval(cursor, clampedStart))
+            }
+            cursor = max(cursor, bEnd)
+        }
+        if (baseEndMinutes > cursor + 15) {
+            freeIntervals.add(FreeInterval(cursor, baseEndMinutes))
+        }
 
         val upcomingExams = repository.getUpcomingExamsSync()
         val activeWeakAreas = repository.getActiveWeakAreasSync()
@@ -110,72 +137,61 @@ class StudyPlannerEngine(private val repository: StudyMindRepository) {
         // Sort candidates by priority
         candidateItems.sortByDescending { it.priorityWeight }
 
-        // Assemble into schedule blocks with 10-minute breaks between blocks
         val blocks = mutableListOf<StudyBlock>()
-        var currentMinutes = startStudyMinutes
+        var candidateIdx = 0
 
-        if (candidateItems.isEmpty()) {
-            // Default healthy revision blocks
-            val defaultSubjects = listOf("الفيزياء", "الرياضيات", "العربية")
-            defaultSubjects.forEach { subj ->
-                if (currentMinutes + 45 <= endStudyMinutes) {
+        for (interval in freeIntervals) {
+            var curr = interval.startMinutes
+            val limit = interval.endMinutes
+
+            while (curr + 25 <= limit) {
+                val candidate = if (candidateIdx < candidateItems.size) {
+                    candidateItems[candidateIdx++]
+                } else null
+
+                val blockDuration = candidate?.duration?.coerceAtMost(limit - curr) ?: (limit - curr).coerceAtMost(40)
+                if (blockDuration < 20) break
+
+                if (candidate != null) {
                     blocks.add(
                         StudyBlock(
-                            startTime = minutesToTime(currentMinutes),
-                            endTime = minutesToTime(currentMinutes + 40),
-                            subjectName = subj,
-                            topic = "مراجعة دورية وحل تمارين",
-                            reason = "مراجعة يومية منتظمة لتثبيت المكتسبات",
-                            durationMinutes = 40
+                            startTime = minutesToTime(curr),
+                            endTime = minutesToTime(curr + blockDuration),
+                            subjectName = candidate.subjectName,
+                            topic = candidate.topic,
+                            reason = candidate.reason,
+                            durationMinutes = blockDuration
                         )
                     )
-                    currentMinutes += 40
-                    if (currentMinutes + 10 <= endStudyMinutes) {
-                        blocks.add(
-                            StudyBlock(
-                                startTime = minutesToTime(currentMinutes),
-                                endTime = minutesToTime(currentMinutes + 10),
-                                subjectName = "استراحة",
-                                topic = "راحة قصيرة، شرب ماء، وتمدد",
-                                reason = "تجديد النشاط الذهني",
-                                durationMinutes = 10,
-                                isBreak = true
-                            )
+                } else {
+                    blocks.add(
+                        StudyBlock(
+                            startTime = minutesToTime(curr),
+                            endTime = minutesToTime(curr + blockDuration),
+                            subjectName = "مراجعة عامة",
+                            topic = "مراجعة دورية وتثبيت مكتسبات",
+                            reason = "استغلال وقت الفراغ المتبقي",
+                            durationMinutes = blockDuration
                         )
-                        currentMinutes += 10
-                    }
+                    )
                 }
-            }
-        } else {
-            for (candidate in candidateItems) {
-                if (currentMinutes + candidate.duration > endStudyMinutes) break
 
-                blocks.add(
-                    StudyBlock(
-                        startTime = minutesToTime(currentMinutes),
-                        endTime = minutesToTime(currentMinutes + candidate.duration),
-                        subjectName = candidate.subjectName,
-                        topic = candidate.topic,
-                        reason = candidate.reason,
-                        durationMinutes = candidate.duration
-                    )
-                )
-                currentMinutes += candidate.duration
+                curr += blockDuration
 
-                // Add 10-minute break if space allows
-                if (currentMinutes + 10 + 25 <= endStudyMinutes) {
+                // Add 10-minute break if at least 25 minutes remain in the current free interval
+                if (curr + 10 + 20 <= limit) {
                     blocks.add(
                         StudyBlock(
-                            startTime = minutesToTime(currentMinutes),
-                            endTime = minutesToTime(currentMinutes + 10),
+                            startTime = minutesToTime(curr),
+                            endTime = minutesToTime(curr + 10),
                             subjectName = "استراحة",
-                            topic = "استراحة قصيرة بعيداً عن الشاشات",
-                            reason = "الحفاظ على التركيز وتفادي الإرهاق",
+                            topic = "راحة قصيرة، شرب ماء، وتمدد",
+                            reason = "تجديد النشاط الذهني",
                             durationMinutes = 10,
                             isBreak = true
                         )
                     )
-                    currentMinutes += 10
+                    curr += 10
                 }
             }
         }
@@ -225,5 +241,24 @@ class StudyPlannerEngine(private val repository: StudyMindRepository) {
 
     private fun getTodayDateString(): String {
         return SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+    }
+
+    private fun getDayOfWeekForDate(dateStr: String): Int {
+        return try {
+            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            val cal = Calendar.getInstance().apply { time = sdf.parse(dateStr) ?: Date() }
+            when (cal.get(Calendar.DAY_OF_WEEK)) {
+                Calendar.MONDAY -> 1
+                Calendar.TUESDAY -> 2
+                Calendar.WEDNESDAY -> 3
+                Calendar.THURSDAY -> 4
+                Calendar.FRIDAY -> 5
+                Calendar.SATURDAY -> 6
+                Calendar.SUNDAY -> 7
+                else -> 1
+            }
+        } catch (_: Exception) {
+            1
+        }
     }
 }

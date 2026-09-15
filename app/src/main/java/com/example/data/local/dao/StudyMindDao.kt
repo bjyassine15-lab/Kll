@@ -109,6 +109,9 @@ interface StudyMindDao {
     @Query("SELECT * FROM exams WHERE id = :id LIMIT 1")
     suspend fun getExamById(id: Long): Exam?
 
+    @Query("SELECT * FROM exams WHERE title LIKE '%' || :title || '%' OR subjectName LIKE '%' || :title || '%' LIMIT 1")
+    suspend fun getExamByTitle(title: String): Exam?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertExam(exam: Exam): Long
 
@@ -125,6 +128,12 @@ interface StudyMindDao {
     @Query("SELECT * FROM assignments WHERE isCompleted = 0 ORDER BY dueDate ASC")
     suspend fun getPendingAssignmentsSync(): List<Assignment>
 
+    @Query("SELECT * FROM assignments WHERE id = :id LIMIT 1")
+    suspend fun getAssignmentById(id: Long): Assignment?
+
+    @Query("SELECT * FROM assignments WHERE title LIKE '%' || :title || '%' OR subjectName LIKE '%' || :title || '%' LIMIT 1")
+    suspend fun getAssignmentByTitle(title: String): Assignment?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAssignment(assignment: Assignment): Long
 
@@ -140,6 +149,12 @@ interface StudyMindDao {
 
     @Query("SELECT * FROM tasks WHERE isCompleted = 0")
     suspend fun getPendingTasksSync(): List<Task>
+
+    @Query("SELECT * FROM tasks WHERE id = :id LIMIT 1")
+    suspend fun getTaskById(id: Long): Task?
+
+    @Query("SELECT * FROM tasks WHERE title LIKE '%' || :title || '%' LIMIT 1")
+    suspend fun getTaskByTitle(title: String): Task?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertTask(task: Task): Long
@@ -211,6 +226,12 @@ interface StudyMindDao {
 
     @Query("SELECT * FROM reminders WHERE isCancelled = 0 AND isTriggered = 0 ORDER BY triggerTimeMillis ASC")
     suspend fun getActiveRemindersSync(): List<Reminder>
+
+    @Query("SELECT * FROM reminders WHERE id = :id LIMIT 1")
+    suspend fun getReminderById(id: Long): Reminder?
+
+    @Query("SELECT * FROM reminders WHERE isCancelled = 0 AND title LIKE '%' || :title || '%' LIMIT 1")
+    suspend fun getReminderByTitle(title: String): Reminder?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertReminder(reminder: Reminder): Long

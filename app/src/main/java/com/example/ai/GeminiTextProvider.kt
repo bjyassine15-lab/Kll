@@ -111,6 +111,57 @@ class GeminiTextProvider(
                         }
                     }
                     addJsonObject {
+                        put("name", "updateExam")
+                        put("description", "تعديل موعد فرض موجود")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان الفرض الحالي للبحث عنه") }
+                                putJsonObject("newTitle") { put("type", "STRING"); put("description", "العنوان الجديد إن وجد") }
+                                putJsonObject("date") { put("type", "STRING"); put("description", "التاريخ الجديد YYYY-MM-DD") }
+                                putJsonObject("time") { put("type", "STRING"); put("description", "الوقت الجديد HH:mm") }
+                            }
+                            putJsonArray("required") { add("title") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "deleteExam")
+                        put("description", "حذف فرض من الجدول")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان الفرض المطلوب حذفه") }
+                            }
+                            putJsonArray("required") { add("title") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "createAssignment")
+                        put("description", "تسجيل واجب منزلي جديد")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("subjectName") { put("type", "STRING"); put("description", "اسم المادة") }
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان الواجب") }
+                                putJsonObject("dueDate") { put("type", "STRING"); put("description", "تاريخ التسليم YYYY-MM-DD") }
+                                putJsonObject("estimatedMinutes") { put("type", "STRING"); put("description", "الوقت التقديري بالدقائق") }
+                            }
+                            putJsonArray("required") { add("subjectName"); add("title") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "updateAssignment")
+                        put("description", "تحديث حالة واجب منزلي")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان الواجب") }
+                                putJsonObject("isCompleted") { put("type", "STRING"); put("description", "هل تم الإنجاز: true أو false") }
+                            }
+                            putJsonArray("required") { add("title") }
+                        }
+                    }
+                    addJsonObject {
                         put("name", "createReminder")
                         put("description", "جدولة تذكير حقيقي في منبه ونظام إشعارات أندرويد")
                         putJsonObject("parameters") {
@@ -121,6 +172,17 @@ class GeminiTextProvider(
                                 putJsonObject("dateTime") { put("type", "STRING"); put("description", "تاريخ ووقت التذكير بصيغة YYYY-MM-DD HH:mm") }
                             }
                             putJsonArray("required") { add("title"); add("message"); add("dateTime") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "cancelReminder")
+                        put("description", "إلغاء تذكير مجدول")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان التذكير المراد إلغاؤه") }
+                            }
+                            putJsonArray("required") { add("title") }
                         }
                     }
                     addJsonObject {
@@ -137,6 +199,68 @@ class GeminiTextProvider(
                         }
                     }
                     addJsonObject {
+                        put("name", "updateTask")
+                        put("description", "تعديل مهمة دراسية")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان المهمة الحالي") }
+                                putJsonObject("newTitle") { put("type", "STRING"); put("description", "العنوان الجديد") }
+                                putJsonObject("priority") { put("type", "STRING"); put("description", "الأولوية الجديدة") }
+                            }
+                            putJsonArray("required") { add("title") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "markTaskComplete")
+                        put("description", "تعليم مهمة دراسية كمكتملة")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان المهمة") }
+                            }
+                            putJsonArray("required") { add("title") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "addScheduleEntry")
+                        put("description", "إضافة حصة إلى جدول الحصص الأسبوعي")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("dayOfWeek") { put("type", "STRING"); put("description", "رقم اليوم 1=الإثنين ... 7=الأحد") }
+                                putJsonObject("startTime") { put("type", "STRING"); put("description", "وقت البداية HH:mm") }
+                                putJsonObject("endTime") { put("type", "STRING"); put("description", "وقت النهاية HH:mm") }
+                                putJsonObject("subjectName") { put("type", "STRING"); put("description", "اسم المادة") }
+                                putJsonObject("teacherName") { put("type", "STRING"); put("description", "اسم الأستاذ") }
+                            }
+                            putJsonArray("required") { add("dayOfWeek"); add("startTime"); add("endTime"); add("subjectName") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "updateScheduleEntry")
+                        put("description", "تعديل حصة في الجدول")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("id") { put("type", "STRING"); put("description", "معرف الحصة") }
+                                putJsonObject("startTime") { put("type", "STRING"); put("description", "وقت البداية") }
+                                putJsonObject("endTime") { put("type", "STRING"); put("description", "وقت النهاية") }
+                            }
+                            putJsonArray("required") { add("id") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "createStudyPlan")
+                        put("description", "إنشاء أو تحديث خطة مذاكرة يومية مقسمة على فترات زمنية محددة")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("date") { put("type", "STRING"); put("description", "تاريخ الخطة YYYY-MM-DD") }
+                            }
+                        }
+                    }
+                    addJsonObject {
                         put("name", "addWeakArea")
                         put("description", "تسجيل نقطة ضعف أو مفهوم يحتاج الطالب لمراجعته والتركيز عليه")
                         putJsonObject("parameters") {
@@ -150,18 +274,6 @@ class GeminiTextProvider(
                         }
                     }
                     addJsonObject {
-                        put("name", "createStudyPlan")
-                        put("description", "إنشاء أو تحديث خطة مذاكرة يومية مقسمة على فترات زمنية محددة")
-                        putJsonObject("parameters") {
-                            put("type", "OBJECT")
-                            putJsonObject("properties") {
-                                putJsonObject("date") { put("type", "STRING"); put("description", "تاريخ الخطة YYYY-MM-DD") }
-                                putJsonObject("explanation") { put("type", "STRING"); put("description", "شرح موجز لسبب هذا التقسيم") }
-                            }
-                            putJsonArray("required") { add("date") }
-                        }
-                    }
-                    addJsonObject {
                         put("name", "savePreference")
                         put("description", "حفظ تفضيل أو وقت عودة للمنزل في سياق الطالب")
                         putJsonObject("parameters") {
@@ -171,6 +283,69 @@ class GeminiTextProvider(
                                 putJsonObject("value") { put("type", "STRING"); put("description", "القيمة مثل 17:30") }
                             }
                             putJsonArray("required") { add("key"); add("value") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "startClassListening")
+                        put("description", "بدء الاستماع والتسجيل لحصة دراسية جارية")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("subjectName") { put("type", "STRING"); put("description", "اسم المادة") }
+                                putJsonObject("teacherName") { put("type", "STRING"); put("description", "اسم الأستاذ") }
+                            }
+                            putJsonArray("required") { add("subjectName") }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "stopClassListening")
+                        put("description", "إيقاف الاستماع للحصة وتلخيص محتواها")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "getTodayPlan")
+                        put("description", "استرجاع خطة المذاكرة المقررة لليوم")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "getUpcomingExams")
+                        put("description", "عرض قائمة الفروض القادمة")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "getAvailableFreeTime")
+                        put("description", "عرض وقت الفراغ المتاح للمذاكرة مساءً")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "getLesson")
+                        put("description", "استرجاع ملخص آخر درس مسجل لمادة معينة")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("subjectName") { put("type", "STRING"); put("description", "اسم المادة") }
+                            }
+                        }
+                    }
+                    addJsonObject {
+                        put("name", "createNote")
+                        put("description", "تدوين ملاحظة دراسية جديدة")
+                        putJsonObject("parameters") {
+                            put("type", "OBJECT")
+                            putJsonObject("properties") {
+                                putJsonObject("title") { put("type", "STRING"); put("description", "عنوان الملاحظة") }
+                                putJsonObject("content") { put("type", "STRING"); put("description", "نص الملاحظة") }
+                                putJsonObject("subjectName") { put("type", "STRING"); put("description", "المادة إن وجدت") }
+                            }
+                            putJsonArray("required") { add("title"); add("content") }
                         }
                     }
                 }

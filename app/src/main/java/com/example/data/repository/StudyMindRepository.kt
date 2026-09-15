@@ -39,6 +39,14 @@ class StudyMindRepository(private val dao: StudyMindDao) {
     val allSubjects: Flow<List<Subject>> = dao.getAllSubjects()
     suspend fun getAllSubjectsSync(): List<Subject> = dao.getAllSubjectsSync()
     suspend fun getSubjectByName(name: String): Subject? = dao.getSubjectByName(name)
+    suspend fun getOrCreateSubjectByName(name: String): Subject {
+        val trimmed = name.trim().ifBlank { "مادة دراسية" }
+        val existing = dao.getSubjectByName(trimmed)
+        if (existing != null) return existing
+        val newSub = Subject(name = trimmed)
+        val id = dao.insertSubject(newSub)
+        return newSub.copy(id = id)
+    }
     suspend fun insertSubject(subject: Subject): Long = dao.insertSubject(subject)
     suspend fun updateSubject(subject: Subject) = dao.updateSubject(subject)
     suspend fun deleteSubject(subject: Subject) = dao.deleteSubject(subject)
@@ -72,6 +80,8 @@ class StudyMindRepository(private val dao: StudyMindDao) {
     val allExams: Flow<List<Exam>> = dao.getAllExams()
     suspend fun getUpcomingExamsSync(nowMillis: Long = System.currentTimeMillis()): List<Exam> =
         dao.getUpcomingExamsSync(nowMillis)
+    suspend fun getExamById(id: Long): Exam? = dao.getExamById(id)
+    suspend fun getExamByTitle(title: String): Exam? = dao.getExamByTitle(title)
     suspend fun insertExam(exam: Exam): Long = dao.insertExam(exam)
     suspend fun updateExam(exam: Exam) = dao.updateExam(exam)
     suspend fun deleteExam(exam: Exam) = dao.deleteExam(exam)
@@ -79,6 +89,8 @@ class StudyMindRepository(private val dao: StudyMindDao) {
     // Assignments
     val allAssignments: Flow<List<Assignment>> = dao.getAllAssignments()
     suspend fun getPendingAssignmentsSync(): List<Assignment> = dao.getPendingAssignmentsSync()
+    suspend fun getAssignmentById(id: Long): Assignment? = dao.getAssignmentById(id)
+    suspend fun getAssignmentByTitle(title: String): Assignment? = dao.getAssignmentByTitle(title)
     suspend fun insertAssignment(assignment: Assignment): Long = dao.insertAssignment(assignment)
     suspend fun updateAssignment(assignment: Assignment) = dao.updateAssignment(assignment)
     suspend fun deleteAssignment(assignment: Assignment) = dao.deleteAssignment(assignment)
@@ -86,6 +98,8 @@ class StudyMindRepository(private val dao: StudyMindDao) {
     // Tasks
     val allTasks: Flow<List<Task>> = dao.getAllTasks()
     suspend fun getPendingTasksSync(): List<Task> = dao.getPendingTasksSync()
+    suspend fun getTaskById(id: Long): Task? = dao.getTaskById(id)
+    suspend fun getTaskByTitle(title: String): Task? = dao.getTaskByTitle(title)
     suspend fun insertTask(task: Task): Long = dao.insertTask(task)
     suspend fun updateTask(task: Task) = dao.updateTask(task)
     suspend fun deleteTask(task: Task) = dao.deleteTask(task)
@@ -116,6 +130,8 @@ class StudyMindRepository(private val dao: StudyMindDao) {
     // Reminders
     val activeReminders: Flow<List<Reminder>> = dao.getActiveReminders()
     suspend fun getActiveRemindersSync(): List<Reminder> = dao.getActiveRemindersSync()
+    suspend fun getReminderById(id: Long): Reminder? = dao.getReminderById(id)
+    suspend fun getReminderByTitle(title: String): Reminder? = dao.getReminderByTitle(title)
     suspend fun insertReminder(reminder: Reminder): Long = dao.insertReminder(reminder)
     suspend fun updateReminder(reminder: Reminder) = dao.updateReminder(reminder)
     suspend fun markReminderTriggered(id: Long) = dao.markReminderTriggered(id)
